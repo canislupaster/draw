@@ -1,11 +1,13 @@
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <cstring>
 
 #include <stdio.h>
 #include <thread>
-#include <stop_token>
+#include <vector>
+#include <exception>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
@@ -25,15 +27,26 @@ public:
 };
 
 class ArduinoSerial {
-	std::mutex recv_running;
 	std::mutex buf_mut;
 	std::condition_variable buf_cond;
 	bool stop=false;
 	std::string buf;
-	bool rd_err=false;
+
+	std::thread recv, send;
+	std::condition_variable send_cond;
+	std::mutex send_mut;
+	std::vector<std::string> send_buf;
+
+	std::optional<std::exception_ptr> err;
 
 	int fd;
 	termios toptions;
+
+	void seterr(std::exception_ptr e) {
+		std::scoped_lock lock(buf_mut, send_mut);
+		err = e;
+		stop=true;
+	}
 
 	void check() {
 		int flags = fcntl(fd, F_GETFL, 0);
@@ -44,6 +57,8 @@ class ArduinoSerial {
 		if ((flags & O_RDWR) == 0) {
 			throw SerialPortException("File descriptor is not open for reading and writing.");
 		}
+
+		if (err) std::rethrow_exception(*err);
 	}
 public:
 	ArduinoSerial(const char *serialport, int baud) {
@@ -57,32 +72,9 @@ public:
 			throw SerialPortException("Failed to get term attributes.");
 		}
 
-		speed_t brate = baud;
-		switch (baud) {
-		case 4800: brate = B4800;
-			break;
-		case 9600: brate = B9600;
-			break;
-#ifdef B14400
-		case 14400: brate = B14400;
-			break;
-#endif
-		case 19200: brate = B19200;
-			break;
-#ifdef B28800
-		case 28800: brate = B28800;
-			break;
-#endif
-		case 38400: brate = B38400;
-			break;
-		case 57600: brate = B57600;
-			break;
-		case 115200: brate = B115200;
-			break;
-		}
-
-		cfsetispeed(&toptions, brate);
-		cfsetospeed(&toptions, brate);
+		//supposed to use standard speeds defined in termios.h i think but whatever
+		cfsetispeed(&toptions, baud);
+		cfsetospeed(&toptions, baud);
 
 		toptions.c_cflag &= ~(PARENB | PARODD);
 		toptions.c_cflag &= ~CSTOPB;
@@ -111,66 +103,96 @@ public:
 		}
 
 		//the best solution i could find :/
-		std::thread([this]() {
-			std::lock_guard recv_lock(recv_running);
-			std::string tmp(1024, 0);
-			while (true) {
-				int r = read(fd, tmp.data(), tmp.size());
+		recv = std::thread([this]() {
+			try {
+				std::string tmp(1024, 0);
 
-				std::lock_guard buf_lock(buf_mut);
-				if (r==-1) rd_err=true;
-				else if (r>0) {
-					buf.append(tmp.substr(0,r));
+				while (true) {
+					int r = read(fd, tmp.data(), tmp.size());
+
+					std::unique_lock buf_lock(buf_mut);
+					if (r==-1) {
+						throw SerialPortException("Failed to read data from serial port.");
+					} else if (r>0) {
+						buf.append(tmp.substr(0,r));
+					}
+
+					if (r!=0) buf_cond.notify_all();
+					if (stop) break;
 				}
-
-				if (r!=0) buf_cond.notify_all();
-				if (stop) break;
+			} catch (...) {
+				seterr(std::current_exception());
 			}
-		}).detach();
+		});
+
+		send = std::thread([this]() {
+			try {
+				std::unique_lock lock(send_mut);
+
+				std::vector<std::string> tmp;
+				while (!stop) {
+					tmp.swap(send_buf);
+					lock.unlock();
+
+					for (auto& str : tmp) {
+						int n = write(fd, str.c_str(), str.size());
+						if (n != str.size()) {
+							lock.unlock();
+							throw SerialPortException("Failed to write data to serial port.");
+							break;
+						}
+
+						tcdrain(fd);
+						//lmfao, small delay between writes is apparently necessary
+						//its ok we have a thread for that
+						usleep(1000*100);
+					}
+
+					tmp.clear();
+
+					lock.lock();
+					if (send_buf.size()) continue;
+
+					send_cond.wait(lock);
+				}
+			} catch (...) {
+				seterr(std::current_exception());
+			}
+		});
 	}
 
 	~ArduinoSerial() {
 		{
-			std::lock_guard buf_lock(buf_mut);
+			std::scoped_lock lock(buf_mut, send_mut);
 			stop=true;
 		}
 
-		recv_running.lock();
+		send_cond.notify_all();
+		recv.join(), send.join();
 		if (fd != -1) close(fd);
 	}
 
-	void writeByte(uint8_t b) {
-		int n = write(fd, &b, 1);
-		if (n != 1)
-			throw SerialPortException("Failed to write byte to serial port.");
+	void writeStr(std::string const& str) {
+		std::unique_lock lock(send_mut);
 		check();
+
+		send_buf.push_back(str);
+		send_cond.notify_all();
 	}
 
-	void writeStr(const char *str) {
-		int len = strlen(str);
-		int n = write(fd, str, len);
-		if (n != len)
-			throw SerialPortException("Failed to write data to serial port.");
-
-		tcdrain(fd);
-		usleep(1000*100); //lmfao, small delay between writes is apparently necessary
-
-		check();
-	}
-
-	void flushInput() {
-		std::unique_lock buf_lock(buf_mut);
-		buf.clear();
+	void discard() {
+		std::scoped_lock lock(buf_mut, send_mut);
+		buf.clear(), send_buf.clear();
 	}
 
 	std::optional<std::string> readUntil(char until, int ms) {
+		std::unique_lock buf_lock(buf_mut);
+
 		check();
 
 		int bufi=0;
 		auto dur = std::chrono::milliseconds(ms);
 		auto then = std::chrono::high_resolution_clock::now()+dur;
-
-		std::unique_lock buf_lock(buf_mut);
 
 		for (bool wait=false; ; wait=true) {
 			auto now = std::chrono::high_resolution_clock::now();

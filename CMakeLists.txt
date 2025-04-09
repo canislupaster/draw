@@ -24,6 +24,6 @@ find_package(OpenGL REQUIRED)
 add_subdirectory(nativefiledialog-extended)
 
 target_include_directories(imgui PUBLIC imgui/)
-target_include_directories(draw PUBLIC svgpp/include imgui/)
+target_include_directories(draw PUBLIC imgui/ cereal/include)
 target_link_libraries(draw PUBLIC imgui PkgConfig::SDL2 OpenGL::GL nfd)
 

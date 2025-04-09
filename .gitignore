@@ -130,4 +130,4 @@ build/
 .idea/
 **/.DS_Store
 imgui.ini
-last_path.txt
+settings.json

@@ -1,13 +1,21 @@
+#include <chrono>
+#include <cstddef>
+#include <exception>
 #include <iostream>
 #include <algorithm>
 #include <vector>
+#include <fstream>
 
 #include "imgui.h"
-#include <stdio.h>
 #include <SDL.h>
 #include <SDL_opengl.h>
 #include "backends/imgui_impl_sdl2.h"
 #include "backends/imgui_impl_opengl3.h"
+
+#include "cereal/archives/json.hpp"
+#include "cereal/types/optional.hpp"
+#include "cereal/types/string.hpp"
+#include "imgui_internal.h"
 
 #define NFD_THROWS_EXCEPTIONS
 #include "nfd.hpp"
@@ -18,6 +26,7 @@
 #include "point.hpp"
 #include "controller.hpp"
 #include "path.hpp"
+#include "style.hpp"
 
 using namespace std;
 
@@ -68,7 +77,50 @@ Texture load_image(string const& filename) {
 	return Texture { image_texture, (void*)(intptr_t)image_texture, image_width, image_height };
 }
 
-int main(int argc, char** argv) {
+template<class T, size_t period=400>
+struct Debounce {
+	T v, lv;
+	optional<chrono::steady_clock::time_point> last_change;
+	chrono::milliseconds p;
+
+	Debounce(T iv): v(iv), lv(iv), p(period) {}
+
+	bool operator()() {
+		if (v!=lv) {
+			lv=v;
+			last_change = chrono::steady_clock::now();
+			return false;
+		} else if (last_change && chrono::steady_clock::now()-*last_change > p) {
+			last_change.reset();
+			return true;
+		} else {
+			return false;
+		}
+	}
+};
+
+struct Save {
+	int baud=230400;
+	optional<Pt> cursor;
+	float slider_time=1.0, slider_overlay_scale=0.5,
+		slider_path_scale=0.5,
+		zoom=1.0, zoom_before=1.0;
+	bool original_colors=false;
+	Pt pan_center = dim/2;
+	optional<string> path;
+	float fill_angle=0.0;
+	float fill_dist=45.0;
+
+	template<class Archive>
+	void serialize(Archive& archive) {
+		archive(CEREAL_NVP(baud), CEREAL_NVP(cursor), CEREAL_NVP(slider_time), CEREAL_NVP(slider_overlay_scale),
+			CEREAL_NVP(slider_path_scale), CEREAL_NVP(zoom), CEREAL_NVP(zoom_before),
+			CEREAL_NVP(original_colors), CEREAL_NVP(pan_center), CEREAL_NVP(path),
+			CEREAL_NVP(fill_angle), CEREAL_NVP(fill_dist));
+	}
+};
+
+int main() {
 	auto sdlerr = []() {
 		auto e = SDL_GetError();
 		if (e && strlen(e)>0) throw runtime_error(e);
@@ -85,7 +137,7 @@ int main(int argc, char** argv) {
 	SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
 	SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
 	SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
-	SDL_WindowFlags window_flags = (SDL_WindowFlags)(SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+	auto window_flags = (SDL_WindowFlags)(SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
 	SDL_Window* window = SDL_CreateWindow("Plotter", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1280, 720, window_flags);
 	if (window == nullptr) sdlerr();
 
@@ -97,9 +149,21 @@ int main(int argc, char** argv) {
 	IMGUI_CHECKVERSION();
 	ImGui::CreateContext();
 	ImGuiIO& io = ImGui::GetIO();
-	io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;     // Enable Keyboard Controls
+	io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+	io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+
+	int display = SDL_GetWindowDisplayIndex(window);
+
+	float dpi;
+	SDL_GetDisplayDPI(display, &dpi, nullptr, nullptr);
+
+	ImFontConfig config;
+	config.RasterizerDensity = dpi/120;
+	auto roboto = io.Fonts->AddFontFromFileTTF("Roboto-Regular.ttf", ceil(16*dpi/226), &config);
 
 	ImGui::StyleColorsDark();
+	embraceTheDarkness();
+
 	ImGui_ImplSDL2_InitForOpenGL(window, gl_context);
 	ImGui_ImplOpenGL3_Init(glsl_version);
 
@@ -119,17 +183,43 @@ int main(int argc, char** argv) {
 	optional<string> err;
 	optional<Plot> plot;
 	std::optional<ImVec2> wind_pos;
+	Debounce<float> pen_amt(0);
 
-	ifstream fin("./last_path.txt");
-	if (string last_path; fin.is_open() && getline(fin, last_path))
-		plot.emplace(last_path);
+	bool lock=false;
 
-	float slider_time=1.0, slider_overlay_scale=0.5, slider_path_scale=0.5, zoom=1.0;
-	Pt pan_center = dim/2;
+	string serial_input(256, '\0');
 
-	auto draw_image = load_image("./draw.png"), move_image = load_image("./move.png");
+	const string settings_path = "./settings.json";
+	ifstream fin(settings_path);
+	Save save;
+	float other_time_slider=save.slider_time;
+
+	auto do_save = [&save, settings_path]() {
+		cout<<"saving..."<<endl;
+
+		ofstream fout(settings_path);
+		auto archive = cereal::JSONOutputArchive(fout);
+		archive(save);
+	};
+
+	if (fin.is_open()) {
+		auto archive = cereal::JSONInputArchive(fin);
+		archive(save);
+		if (save.path) try {
+			plot.emplace(*save.path, save.fill_angle, save.fill_dist);
+		} catch (exception const& ex) {
+			err = ex.what();
+		}
+	}
+
+	auto draw_image = load_image("./draw.png"),
+		move_image = load_image("./move.png"),
+		idle_image = load_image("./idle.png"),
+		cursor_image = load_image("./cursor.png");
 
 	bool err_open=false;
+
+	uint64_t fps_ticks = SDL_GetPerformanceFrequency()/60, last_swap = 0;
 
 	bool done=false;
 	while (!done) {
@@ -143,22 +233,35 @@ int main(int argc, char** argv) {
 		ImGui_ImplOpenGL3_NewFrame();
 		ImGui_ImplSDL2_NewFrame();
 		ImGui::NewFrame();
+		ImGui::PushFont(roboto);
 
-		ImGui::Begin("Settings");
+		auto viewport = ImGui::GetMainViewport();
+		ImGuiID dockspace_id = ImGui::DockSpaceOverViewport(viewport, ImGuiDockNodeFlags_PassthruCentralNode);
 
-		ImGui::SeparatorText("Preview options");
-		ImGui::BeginGroup();
-			ImGui::SliderFloat("Time", &slider_time, 0.0, 1.0);
-			ImGui::SliderFloat("Scale overlay", &slider_overlay_scale, 0.0, 1.0);
-			ImGui::SliderFloat("Scale path", &slider_path_scale, 0.0, 1.0);
-			ImGui::SliderFloat("Zoom", &zoom, 1.0, 15.0);
+		ImGui::Begin("Settings", nullptr, ImGuiWindowFlags_None);
+
+		if (ImGui::CollapsingHeader("Preview options",ImGuiTreeNodeFlags_DefaultOpen)) {
+			if (!plot) {
+				ImGui::Text("Load an SVG to see preview");
+			}
+
+			//lmfao
+			if (ImGui::SliderFloat("Time", &other_time_slider, 0.0,1.0))
+				save.slider_time = other_time_slider;
+			if (ImGui::DragFloat("Time (fine)", &save.slider_time, 25.0f/plot->total_time, 0.0,1.0))
+				other_time_slider = save.slider_time;
+
+			ImGui::SliderFloat("Scale overlay", &save.slider_overlay_scale, 0.0, 1.0);
+			ImGui::SliderFloat("Scale path", &save.slider_path_scale, 0.0, 1.0);
+
+			ImGui::DragFloat("Zoom", &save.zoom, 0.1, 0.1, 50.0);
 
 			if (ImGui::Button("Reset position")) {
-				pan_center = dim/2;
+				save.pan_center = dim/2;
 			}
-		ImGui::EndGroup();
 
-		ImGui::SeparatorText("Control");
+			ImGui::Checkbox("Show original colors", &save.original_colors);
+		}
 
 		if (err && !err_open) {
 			err_open=true;
@@ -175,47 +278,99 @@ int main(int argc, char** argv) {
 
 		optional<Controller::Guard> state;
 		try {
-			if (cur_control) {
-				auto& g = state.emplace(std::move(cur_control->guard()));
-				if (g->err) err=g->err->what();
+			if (ImGui::CollapsingHeader("Controls",ImGuiTreeNodeFlags_DefaultOpen)) {
+				if (cur_control) {
+					auto& g = state.emplace(std::move(cur_control->guard()));
+					if (auto e = g.err(); e) {
+						try {
+							rethrow_exception(*e);
+						} catch (std::exception const& ex) {
+							err = ex.what();
+						}
+					}
 
-				if (g->running || g.paused() || g->cancelled) {
-					if (g->cancelled) {
-						ImGui::Text("Cancelling...");
-					} else {
+					if (g->ty!=Controller::State::Idle) {
+						if (g->ty==Controller::State::PausedForColorChange) {
+							ImGui::Text("Change pen color to:");
+
+							auto list = ImGui::GetWindowDrawList();
+							auto pos = ImGui::GetCursorScreenPos();
+
+							const float sz = 40.0, pad=5.0;
+							pos.x+=pad; pos.y+=pad;
+							list->AddRectFilled(pos, ImVec2(pos.x+sz,pos.y+sz), *g->next_color);
+							ImGui::SetCursorScreenPos(ImVec2(pos.x-pad, pos.y+sz+pad));
+						}
+
 						ImGui::Text(g.paused() ? "PAUSED" : "DRAWING");
 						if (ImGui::Button(g.paused() ? "Resume" : "Stop")) {
 							if (g.paused()) g.resume(); else g.pause();
 						}
+					} else if (plot && ImGui::Button("Start")) {
+						g.start_paths(plot->paths);
 					}
-				} else if (ImGui::Button("Start")) {
-					Controller::start(cur_control, plot->paths);
-				}
 
-				ImGui::SameLine();
-				if (ImGui::Button("Cancel")) g.cancel(false);
-				ImGui::SameLine();
-				if (ImGui::Button("Reset")) g.cancel(true);
+					ImGui::SameLine();
+					if (ImGui::Button("Cancel")) g.cancel(false);
+					ImGui::SameLine();
+					if (ImGui::Button("Reset")) g.cancel(true);
 
-				if (!g->running && ImGui::Button("Disconnect")) {
-					cur_control.reset();
+					ImGui::Checkbox("Lock", &lock);
+					if (lock!=g->locked) lock ? g.do_lock() : g.unlock();
+
+					if (g->ty==Controller::State::Idle && ImGui::Button("Disconnect")) {
+						state.reset();
+						cur_control.reset();
+					}
+				} else {
+					ImGui::InputInt("Baud rate", &save.baud);
+
+					if (ImGui::Button("Connect")) {
+						cur_control = make_shared<Controller>(save.baud);
+						lock = cur_control->guard()->locked;
+					}
 				}
-			} else if (plot && ImGui::Button("Connect")) {
-				cur_control = make_shared<Controller>();
 			}
 
-			if ((!state || (!state->get().running && !state->paused()))
-				&& ImGui::Button("Load path")) {
+			if ((!state || state->get().ty==Controller::State::Idle)
+				&& ImGui::CollapsingHeader("Import",ImGuiTreeNodeFlags_DefaultOpen)) {
 
-				NFD::UniquePath outPath;
-				nfdfilteritem_t filterItem[1] = {{"SVG", "svg"}};
+				ImGui::SliderAngle("Fill angle", &save.fill_angle,0,180);
+				ImGui::InputFloat("Fill distance", &save.fill_dist, 5.0);
 
-				if (NFD::OpenDialog(outPath, filterItem, 1)==NFD_OKAY) {
-					plot.emplace(std::string(outPath.get()));
-
-					ofstream fout("./last_path.txt");
-					fout<<outPath.get()<<endl;
+				if (save.path) {
+					ImGui::TextWrapped("Loaded %s", save.path->c_str());
 				}
+
+				bool reload = save.path && ImGui::Button("Reload");
+				if (reload || ImGui::Button("Load SVG")) {
+					NFD::UniquePath outPath;
+					nfdfilteritem_t filterItem = {"SVG", "svg"};
+
+					if (reload || NFD::OpenDialog(outPath, &filterItem, 1)==NFD_OKAY) {
+						std::string path = reload ? *save.path : outPath.get();
+
+						plot.emplace(path, save.fill_angle, save.fill_dist);
+
+						save.path = path;
+						do_save();
+					}
+				}
+			}
+
+			if ((state && state->get().ty!=Controller::State::Running)
+				&& ImGui::CollapsingHeader("Jog",ImGuiTreeNodeFlags_DefaultOpen)) {
+				if (save.cursor) {
+					ImGui::Text("X %.2f, Y %.2f", save.cursor->x, save.cursor->y);
+					if (ImGui::Button("Jog to cursor"))
+						state->jog(*save.cursor);
+				} else ImGui::Text("Click on preview to set cursor");
+
+				ImGui::SliderFloat("Pen", &pen_amt.v, 0.0, 1.0);
+				if (pen_amt()) state->set_pen_amt(pen_amt.v);
+
+				if (state->get().jogging && ImGui::Button("Stop jogging"))
+					state->halt();
 			}
 		} catch (exception const& ex) {
 			err = ex.what();
@@ -223,50 +378,98 @@ int main(int argc, char** argv) {
 
 		ImGui::End();
 
+		ImGui::Begin("Logs", nullptr, ImGuiWindowFlags_None);
+
+    if (state) {
+			for (string const& log : state->get().log) {
+				ImGui::TextWrapped("%s", log.c_str());
+			}
+
+			ImGui::InputText("Message", serial_input.data(), serial_input.size());
+			ImGui::SameLine();
+			if (ImGui::SmallButton("Send")) {
+				string msg(serial_input.c_str());
+				msg.push_back('\n');
+				state->send(msg);
+			}
+		} else {
+			ImGui::Text("No logs yet.");
+		}
+
+    ImGui::End();
+
 		// ImGui::SetNextWindowSizeConstraints(ImVec2(1,1), ImGui::GetMainViewport()->Size, size_cb);
-		if (wind_pos) ImGui::SetNextWindowPos(*wind_pos);
-		ImGui::Begin("Preview", nullptr, ImGuiWindowFlags_None);
+		// if (wind_pos) ImGui::SetNextWindowPos(*wind_pos);
+		// ImGui::Begin("Preview", nullptr, ImGuiWindowFlags_None);
 
 		if (plot) {
-			auto cur_sz = ImGui::GetWindowSize();
-			float plot_bound_sc = min(cur_sz.x/dim.x, cur_sz.y/dim.y);
+			auto node = ImGui::DockBuilderGetCentralNode(dockspace_id);
 
-			auto drawlist = ImGui::GetWindowDrawList();
-			auto windowPosIm = ImGui::GetWindowPos();
+			auto cur_sz = node->Size;
+			ImVec2 windowPosIm = node->Pos;
 			Pt windowPos(windowPosIm);
 
-			auto affine_trans = windowPos + (dim/2 - pan_center*zoom)*plot_bound_sc;
-			float trans_mul = plot_bound_sc*zoom;
+			float plot_bound_sc = min(cur_sz.x/dim.x, cur_sz.y/dim.y);
+
+			auto drawlist = ImGui::GetBackgroundDrawList(viewport);
+
+			auto affine_trans = windowPos + (dim/2 - save.pan_center*save.zoom)*plot_bound_sc;
+			float trans_mul = plot_bound_sc*save.zoom*dpi/226.0f;
+
+			float overlay_thick = save.slider_overlay_scale*dpi/226.0f;
+
+			float path_thick1 = 4.0f*save.slider_path_scale*dpi/226.0f;
+			float path_thick2 = 5.0f*save.slider_path_scale*dpi/226.0f;
 
 			auto trans = [windowPos, trans_mul, affine_trans](Pt x) {
 				return (x*trans_mul + affine_trans).imvec();
 			};
 
-			auto render_cmd = [&drawlist, slider_path_scale, trans, &palette](DrawCmd const& c, int pi) {
+			auto render_cmd = [&drawlist, &save, trans, &palette, &plot, path_thick1, path_thick2](DrawCmd const& c, int pi) {
+				uint32_t col = save.original_colors ? plot->paths[pi].color : palette[pi%palette.size()];
+
 				if (c.ty==DrawCmd::Cubic)
 					drawlist->AddBezierCubic(trans(c.pts[0]), trans(c.pts[1]),
 						trans(c.pts[2]), trans(c.pts[3]),
-						palette[pi%palette.size()], 5.0f*slider_path_scale);
+						col, path_thick2);
 				else
 					drawlist->AddLine(trans(c.pts[0]), trans(c.pts[1]),
-						palette[pi%palette.size()], 5.0f*slider_path_scale);
+						col, path_thick2);
 			};
 
-			drawlist->AddRect(trans(Pt(0,0)), trans(dim), IM_COL32(255,255,0,255), 0, 0, 3.0*slider_overlay_scale);
+			drawlist->AddRect(trans(Pt(0,0)), trans(dim), IM_COL32(255,255,0,255), 0, 0,
+				3.0f*overlay_thick);
 
-			ImGui::InvisibleButton("previewBg", ImGui::GetContentRegionAvail());
-			if (ImGui::IsMouseDragging(ImGuiMouseButton_Left) && ImGui::IsItemActive()) {
-				wind_pos = windowPosIm;
+			// ImGui::InvisibleButton("previewBg", ImGui::GetContentRegionAvail());
+			if (ImGui::IsMouseDragging(ImGuiMouseButton_Left) && !io.WantCaptureMouse) {
+				// wind_pos = windowPosIm;
 
 				Pt del = ImGui::GetMouseDragDelta();
-				pan_center = pan_center - del/trans_mul;
-				ImGui::ResetMouseDragDelta();
+				if (ImGui::IsKeyDown(ImGuiKey_LeftShift)) {
+					Pt pos = ImGui::GetMousePos(), center = windowPos + Pt(cur_sz)/2;
+					Pt d_center = (pos-del-center).unit();
+					d_center = d_center*(pos-center).unit().dot(d_center)*(10.0f/Pt(cur_sz).norm());
+
+					float fac = del.dot(d_center);
+					save.zoom = save.zoom_before*clamp((1+fac/2), 0.01f, 50.0f);
+
+					drawlist->AddLine(pos.imvec(), center.imvec(), IM_COL32(255,0,0,255), 2.0f*overlay_thick);
+				} else {
+					save.pan_center = save.pan_center - del/trans_mul;
+					ImGui::ResetMouseDragDelta();
+				}
 			} else {
 				wind_pos.reset();
+				save.zoom_before = save.zoom;
+			}
+
+			if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !io.WantCaptureMouse) {
+				auto pos = ImGui::GetMousePos();
+				save.cursor = (Pt(pos) - affine_trans)/trans_mul;
 			}
 
 			Pt last;
-			auto ft = plot->find_t(slider_time*plot->total_time);
+			auto ft = plot->find_t(save.slider_time*plot->total_time);
 
 			for (int pi=0; pi<min((int)plot->paths.size(), ft.path_i+1); pi++) {
 				auto const& c = plot->paths[pi].cmds;
@@ -275,21 +478,23 @@ int main(int argc, char** argv) {
 					render_cmd(c[i], pi);
 				}
 
-				if (max_cmdi!=-1 && max_cmdi<c.size()-1) {
+				if (max_cmdi!=-1 && max_cmdi<c.size()) {
 					auto np = c[max_cmdi].trim(0, ft.cmd_t);
 					render_cmd(np, pi);
 				}
 
-				for (int i=0; i<max_cmdi; i++) {
+				for (int i=0; i<(ft.path_i==pi ? ft.cmd_i+1 : c.size()); i++) {
 					drawlist->AddCircleFilled(trans(c[i].start()),
-						8.0*slider_overlay_scale, IM_COL32(255,255,0,255));
-					if (i==max_cmdi-1)
-						drawlist->AddCircleFilled(trans(c[i].end()),
-							8.0*slider_overlay_scale, IM_COL32(255,255,0,255));
+						8.0f*overlay_thick, IM_COL32(255,255,0,255));
+				}
+
+				if (max_cmdi==c.size()) {
+					drawlist->AddCircleFilled(trans(c.back().end()),
+						8.0f*overlay_thick, IM_COL32(255,255,0,255));
 				}
 
 				if (pi>0) {
-					const float dash_len = maxw/70.0/zoom;
+					const float dash_len = maxw/70.0/save.zoom;
 					Pt dif = plot->paths[pi].start() - last;
 					float tot = dif.norm(), inc=dash_len/tot;
 
@@ -297,7 +502,7 @@ int main(int argc, char** argv) {
 					for (float t=0.0; t<1.0; t+=inc, d=!d) {
 						Pt nxt = last + dif*min(t+inc, 1.0f);
 						if (d || t+inc>=1.0)
-							drawlist->AddLine(trans(prev), trans(nxt), IM_COL32_WHITE, 4.0f*slider_path_scale);
+							drawlist->AddLine(trans(prev), trans(nxt), IM_COL32_WHITE, path_thick1);
 						prev=nxt;
 					}
 				}
@@ -305,36 +510,55 @@ int main(int argc, char** argv) {
 				last = plot->paths[pi].end();
 			}
 
-			drawlist->AddCircleFilled(trans(ft.pt), 12.0*slider_overlay_scale, IM_COL32(0, 255, 255, 255));
+			drawlist->AddCircleFilled(trans(ft.pt), 12.0*overlay_thick, IM_COL32(0, 255, 255, 255));
 
 			if (state && state->get().last_stat) {
 				auto [current, from, to, is_drawing] = *state->get().last_stat;
-				const float tri_w = 10.0*slider_overlay_scale/plot_bound_sc;
+				float tri_w = 26.0*overlay_thick/trans_mul;
 
-				Pt dif = to - from, perp = Pt(-dif.y, dif.x).unit();
-				Pt up_cur = current+dif.unit()*tri_w*2;
-				Pt l = current - perp*tri_w, r = current+perp*tri_w,
-					ul = up_cur - perp*tri_w, ur = up_cur+perp*tri_w;
+				Pt dif = to - from;
+				bool still = dif==Pt(0,0);
+				if (still) dif={tri_w,0};
+				else dif=dif.unit()*tri_w;
 
-				drawlist->AddImageQuad(is_drawing ? draw_image.texture : move_image.texture,
+				Pt perp = Pt(-dif.y, dif.x);
+
+				Pt up_cur = current+dif;
+				current=current-dif;
+				Pt l = current - perp, r = current+perp,
+					ul = up_cur - perp, ur = up_cur+perp;
+
+				drawlist->AddImageQuad(is_drawing ? draw_image.texture : (still ? idle_image.texture : move_image.texture),
 					trans(l), trans(r), trans(ur), trans(ul),
 					ImVec2(1,0), ImVec2(1,1), ImVec2(0,1), ImVec2(0,0),
 					IM_COL32(255, 0, 0, 255));
 
-				drawlist->AddLine(trans(from), trans(to), IM_COL32(255, 0, 0, 255), 6.0f*slider_overlay_scale);
+				if (!still) drawlist->AddLine(trans(from), trans(to),
+					IM_COL32(255, 0, 0, 255), 6.0f*overlay_thick);
 			}
-		} else {
-			ImGui::Text("Load an SVG to see preview.");
+
+			float cursor_w = 30.0f*overlay_thick/trans_mul;
+			if (save.cursor) {
+				Pt off(cursor_w/2, cursor_w/2);
+				drawlist->AddImage(cursor_image.texture,
+					trans(*save.cursor-off), trans(*save.cursor+off),
+					ImVec2(0,0), ImVec2(1,1));
+			}
 		}
 
-		ImGui::End();
-
+		ImGui::PopFont();
 		ImGui::Render();
+
 		glViewport(0, 0, (int)io.DisplaySize.x, (int)io.DisplaySize.y);
 		glClearColor(0.0,0.0,0.0,1.0);
 		glClear(GL_COLOR_BUFFER_BIT);
 		ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 		SDL_GL_SwapWindow(window);
+
+		uint64_t tick = SDL_GetPerformanceCounter();
+		if (tick < fps_ticks + last_swap)
+			SDL_Delay((1000*(fps_ticks + last_swap - tick))/SDL_GetPerformanceFrequency());
+		last_swap = SDL_GetPerformanceCounter();
 	}
 
 	ImGui_ImplOpenGL3_Shutdown();
@@ -344,6 +568,8 @@ int main(int argc, char** argv) {
 	SDL_GL_DeleteContext(gl_context);
 	SDL_DestroyWindow(window);
 	SDL_Quit();
+
+	do_save();
 
 	return 0;
 }

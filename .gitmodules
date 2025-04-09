@@ -1,3 +1,10 @@
 [submodule "nativefiledialog-extended"]
 	path = nativefiledialog-extended
 	url = https://github.com/btzy/nativefiledialog-extended.git
+[submodule "imgui"]
+	path = imgui
+	url = https://github.com/ocornut/imgui.git
+	branch = docking
+[submodule "cereal"]
+	path = cereal
+	url = https://github.com/USCiLab/cereal.git

@@ -12,6 +12,12 @@
       "args": [],
       "preLaunchTask": "CMake: build",
       "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "attach",
+      "name": "Attach",
+      "pid": "${command:pickMyProcess}" // use ${command:pickProcess} to pick other users' processes
     }
   ]
 }

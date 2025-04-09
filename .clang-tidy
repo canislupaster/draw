@@ -1,0 +1,4 @@
+---
+Checks: 'bugprone-*,modernize-*,performance-*,misc-*,-misc-non-private-member-variables-in-classes,-modernize-use-trailing-return-type,-performance-avoid-endl'
+CheckOptions: [{ key: misc-non-private-member-variables-in-classes, value: IgnoreClassesWithAllMemberVariablesBeingPublic }]
+HeaderFilterRegex: \./.+
