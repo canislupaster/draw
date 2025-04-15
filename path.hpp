@@ -1,6 +1,7 @@
 #ifndef PLOT_IMPLEMENTATION
 #define PLOT_IMPLEMENTATION
 
+#include <filesystem>
 #include <limits>
 #include <list>
 #include <map>
@@ -9,6 +10,7 @@
 #include <queue>
 #include <random>
 #include <stack>
+#include <stdexcept>
 #define NANOSVG_IMPLEMENTATION
 #include "nanosvg.h"
 
@@ -204,12 +206,12 @@ optional<array<Pt,2>> to_line(span<const Pt, 4> curve) {
 	// 	else if (v>tmax) tmax=t, tmax_v=v;
 	// };
 
-	// bool y_nonzero = abs(y)>EPS;
+	// bool y_nonzero = abs(y)>Epsilon;
 	// if (y_nonzero && der>=0) {
 	// 	float v = sqrt(der);
 	// 	chk((-x+v)/(2*y));
-	// 	if (v>EPS) chk((-x-v)/(2*y));
-	// } else if (!y_nonzero && abs(x)>EPS) {
+	// 	if (v>Epsilon) chk((-x-v)/(2*y));
+	// } else if (!y_nonzero && abs(x)>Epsilon) {
 	// 	chk(-b/x);
 	// }
 
@@ -319,7 +321,7 @@ struct Poly {
 			float det1=d1.det(d3), det2=d2.det(d3), d3sq = d3.sq();
 
 			if (abs(det1-det2)<=Epsilon || d3sq<Epsilon) {
-				// if (abs(det1)>EPS) return false;
+				// if (abs(det1)>Epsilon) return false;
 				//lines are colinear
 				// float dot1 = d1.dot(d3), dot2=d2.dot(d3);
 				// return !((dot1<0 && dot2<0) || (dot1>d3sq && dot2>d3sq));
@@ -403,7 +405,7 @@ struct Poly {
 			for (auto it=idx.begin(); it!=idx.end();) {
 				int p = it==idx.begin() ? idx.back() : *prev(it);
 				int n = next(it)==idx.end() ? idx.front() : *next(it);
-				bool degen = abs((pts[p]-pts[*it]).det(pts[n]-pts[*it]))<EPS;
+				bool degen = abs((pts[p]-pts[*it]).det(pts[n]-pts[*it]))<Epsilon;
 				if (degen || ((inside[p][n] || inside[n][p])
 						&& (inside[p][*it] || inside[*it][p])
 						&& (inside[n][*it] || inside[*it][n]))) {
@@ -744,7 +746,7 @@ vector<Poly> Poly::monotone_fill(vector<Poly> polys, float dist) {
 		auto clean_chain = [](vector<Pt>& pts) {
 			vector<Pt> new_pts;
 			for (int i=0; i<pts.size(); i++) {
-				while (new_pts.size()>=2 && abs((new_pts[new_pts.size()-2]-new_pts.back()).det(pts[i]-new_pts.back()))<EPS)
+				while (new_pts.size()>=2 && abs((new_pts[new_pts.size()-2]-new_pts.back()).det(pts[i]-new_pts.back()))<Epsilon)
 					new_pts.pop_back();
 
 				if (new_pts.empty() || (new_pts.back()-pts[i]).sq()>1e-4)
@@ -798,20 +800,20 @@ vector<Poly> Poly::monotone_fill(vector<Poly> polys, float dist) {
 			if (c->left_pts.empty() || c->right_pts.empty()) break;
 
 			Pt ls=c->left_pts.back()-sl, rs=c->right_pts.back()-sr;
-			Pt o=sl + (ls.y<EPS ? 0 : ls*(y-sl.y)/ls.y),
-				t=sr + (rs.y<EPS ? 0 : rs*(y-sr.y)/rs.y);
+			Pt o=sl + (ls.y<Epsilon ? 0 : ls*(y-sl.y)/ls.y),
+				t=sr + (rs.y<Epsilon ? 0 : rs*(y-sr.y)/rs.y);
 
-			float lx = ls.y<EPS ? numeric_limits<float>::max() : dist*max(1.0f,abs(ls.x/ls.y));
-			float rx = rs.y<EPS ? numeric_limits<float>::max() : dist*max(1.0f,abs(rs.x/rs.y));
+			float lx = ls.y<Epsilon ? numeric_limits<float>::max() : dist*max(1.0f,abs(ls.x/ls.y));
+			float rx = rs.y<Epsilon ? numeric_limits<float>::max() : dist*max(1.0f,abs(rs.x/rs.y));
 			Pt l=o+Pt(lx,0), r=t-Pt(rx,0);
 			l.x = min(l.x, max(c->left_pts.back().x, sl.x)+dist);
 			r.x = max(r.x, min(c->right_pts.back().x, sr.x)-dist);
 
 			if (l.x > r.x) {
-				l=r=abs(ls.x*rs.y) < EPS ? o : (o+(t-o)/(1 + abs(ls.y*rs.x/(ls.x*rs.y))));
+				l=r=abs(ls.x*rs.y) < Epsilon ? o : (o+(t-o)/(1 + abs(ls.y*rs.x/(ls.x*rs.y))));
 			}
 
-			bool diff = r.x-l.x > EPS;
+			bool diff = r.x-l.x > Epsilon;
 
 			switch (ty) {
 				case Ev::Left:
@@ -933,6 +935,10 @@ struct Plot {
 	float total_time;
 
 	Plot(string const& file_path, float fill_angle, float fill_dist) {
+		if (!filesystem::exists(file_path)) {
+			throw runtime_error(format("SVG {} not found", file_path));
+		}
+
 		NSVGimage* img = nsvgParseFromFile(file_path.c_str(), "px", 96);
 
 		float scale = min(maxw/img->width, maxh/img->height);

@@ -48,11 +48,17 @@ struct Texture {
 	}
 };
 
-// Simple helper function to load an image into a OpenGL texture with common settings
+constexpr string RESOURCE_ROOT = "./resources";
+
 Texture load_image(string const& filename) {
 	int image_width = 0;
 	int image_height = 0;
-	unsigned char* image_data = stbi_load(filename.c_str(), &image_width, &image_height, nullptr, 4);
+
+	unsigned char* image_data = stbi_load(
+		(filesystem::path(RESOURCE_ROOT) / filename).c_str(),
+		&image_width, &image_height, nullptr, 4
+	);
+
 	if (image_data == nullptr)
 		throw runtime_error("failed to load image");
 
@@ -212,10 +218,10 @@ int main() {
 		}
 	}
 
-	auto draw_image = load_image("./draw.png"),
-		move_image = load_image("./move.png"),
-		idle_image = load_image("./idle.png"),
-		cursor_image = load_image("./cursor.png");
+	auto draw_image = load_image("draw.png"),
+		move_image = load_image("move.png"),
+		idle_image = load_image("idle.png"),
+		cursor_image = load_image("cursor.png");
 
 	bool err_open=false;
 
